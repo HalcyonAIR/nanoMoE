@@ -79,8 +79,11 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class Router(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_id: int):
         super().__init__()
+
+        # NEW: Store layer_id for telemetry
+        self.layer_id = layer_id
 
         # router settings
         self.top_k = config.top_k
@@ -111,6 +114,9 @@ class Router(nn.Module):
         with ctx:
             B, T, _ = x.size()
             num_tokens = B * T
+
+            # NEW: Apply lens transformation before routing (Phase 1: identity)
+            x = MANAGER.apply_lens(x, self.layer_id)
 
             # eq (4) in (https://arxiv.org/abs/1701.06538)
             logits = self.w_g(x)  # [B, T, n_exp]
@@ -171,6 +177,14 @@ class Router(nn.Module):
             # compute amount of used capacity by taking a sum over mask
             exp_mask *= torch.lt(exp_rank, exp_capacity) # [k, B * T, n_exp]
             used_capacity = torch.sum(exp_mask, dim=(0, 1)) # [n_exp]
+
+            # NEW: Log routing event for telemetry (Phase 1)
+            MANAGER.add_routing_event(
+                layer_id=self.layer_id,
+                used_capacity=used_capacity,
+                n_experts=self.n_exp,
+                top_k=self.top_k,
+            )
 
             # mask rank to only include tokens that are selected
             # perform a sum so each row only contains index of token
@@ -288,9 +302,10 @@ class MLPExperts(nn.Module):
         return x
 
 class MOELayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_id: int):
         super().__init__()
-        self.router = Router(config) # (noisy) top k router
+        self.layer_id = layer_id  # Store for reference
+        self.router = Router(config, layer_id) # (noisy) top k router
         self.experts = MLPExperts(config) # group of MLPs (experts)
 
     def forward(self, x: torch.Tensor):
@@ -322,13 +337,15 @@ class MOELayer(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, use_moe=False):
+    def __init__(self, config, use_moe=False, layer_id: int = -1):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         if use_moe:
-            self.mlp = MOELayer(config)
+            # Assertion: layer_id must be valid for MoE blocks
+            assert layer_id >= 0, f"MoE block requires valid layer_id, got {layer_id}"
+            self.mlp = MOELayer(config, layer_id)
         else:
             self.mlp = MLP(config)
 
@@ -373,17 +390,23 @@ class GPT(nn.Module):
         self.config = config
 
         if config.n_exp == 1:
-            # create normal transformer blocks
+            # create normal transformer blocks (no MoE, layer_id not needed)
             blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         else:
             # create transformer blocks, placing an MoE block every <stride> layers
+            # Track MoE layer index separately for telemetry
             blocks = []
+            moe_layer_idx = 0
             for i in range(config.n_layer):
-                # TODO: how to implement this?
-                # should we change below to i + 1 ?
                 use_moe = (i % config.stride) == 0
-                blocks.append(Block(config, use_moe=use_moe))
+                if use_moe:
+                    blocks.append(Block(config, use_moe=True, layer_id=moe_layer_idx))
+                    moe_layer_idx += 1
+                else:
+                    blocks.append(Block(config, use_moe=False))
             blocks = nn.ModuleList(blocks)
+            # Store number of MoE layers for telemetry validation
+            self._n_moe_layers = moe_layer_idx
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),

@@ -32,6 +32,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from manager import MANAGER
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -230,6 +231,55 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
+# -----------------------------------------------------------------------------
+# ChronoMoE Phase 1: Initialize telemetry
+# -----------------------------------------------------------------------------
+if master_process and n_exp > 1:
+    import uuid
+    from chrono.io import create_run_manifest
+    from chrono.snapshots import SystemSnapshot
+
+    # Generate unique run_id
+    run_id = f"run_{uuid.uuid4().hex[:8]}"
+
+    # Get number of MoE layers from model
+    n_moe_layers = getattr(model, '_n_moe_layers', None)
+
+    # Initialize telemetry
+    MANAGER.initialize_telemetry(
+        run_id=run_id,
+        output_dir=os.path.join(out_dir, 'telemetry'),
+        n_moe_layers=n_moe_layers,
+    )
+
+    # Build config for manifest
+    telemetry_config = {
+        'dataset': dataset,
+        'seed': 1337 + seed_offset,
+        'n_layer': n_layer,
+        'n_experts_per_layer': [n_exp] * (n_moe_layers or 0),
+        'top_k': top_k,
+        'capacity_factor': train_capacity,
+        'aux_loss_weight': aux_loss_weight,
+        'use_aux_loss': use_aux_loss,
+        'router_z_loss_weight': router_z_loss_weight,
+        'use_router_z_loss': use_router_z_loss,
+        'learning_rate': learning_rate,
+        'batch_size': batch_size,
+        'max_iters': max_iters,
+        'eval_interval': eval_interval,
+    }
+
+    # Write manifest
+    manifest = create_run_manifest(
+        run_id=run_id,
+        model_name=f"GPT-MoE-{n_layer}L-{n_exp}E",
+        config=telemetry_config,
+    )
+    MANAGER.telemetry_writer.write_manifest(manifest)
+    print(f"ChronoMoE telemetry initialized: {run_id}")
+    print(f"  Output: {MANAGER.telemetry_writer.run_dir}")
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
@@ -254,6 +304,9 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
+    # ChronoMoE: Set INFER mode during evaluation
+    if MANAGER.is_telemetry_enabled():
+        MANAGER.set_mode("INFER")
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
@@ -263,6 +316,9 @@ def estimate_loss():
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
+    # ChronoMoE: Restore TRAIN mode
+    if MANAGER.is_telemetry_enabled():
+        MANAGER.set_mode("TRAIN")
     return out
 
 # learning rate decay scheduler (cosine with warmup)
@@ -290,6 +346,12 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+# ChronoMoE: Initialize step counter before loop
+if MANAGER.is_telemetry_enabled():
+    MANAGER.set_step(iter_num)
+    MANAGER.set_mode("TRAIN")
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -309,6 +371,38 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+
+        # ChronoMoE: Create and write snapshot at eval checkpoint
+        if MANAGER.is_telemetry_enabled():
+            n_moe_layers = getattr(raw_model, '_n_moe_layers', 0)
+            snapshot = SystemSnapshot.from_events(
+                events=MANAGER.get_routing_events(),
+                step=iter_num,
+                train_loss=float(losses['train']),
+                val_loss=float(losses['val']),
+                run_id=MANAGER.run_id,
+                model_name=f"GPT-MoE-{n_layer}L-{n_exp}E",
+                n_layers=n_moe_layers,
+                alert_history=MANAGER.alert_history,
+            )
+            MANAGER.telemetry_writer.write_snapshot(snapshot)
+
+            # Print alerts if any
+            if snapshot.alerts:
+                print(f"\n  ALERTS at step {iter_num}:")
+                for alert in snapshot.alerts:
+                    print(f"    {alert}")
+                print()
+
+            # Log topology metrics
+            for layer in snapshot.layers:
+                print(f"  Layer {layer.layer_id}: Neff={layer.n_effective:.2f}, "
+                      f"Top2={layer.top2_share:.2f}, dead={layer.dead_expert_count}")
+
+            # Flush routing events after snapshot
+            flushed = MANAGER.flush_routing_events()
+            print(f"  Flushed {flushed} routing events")
+
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -363,6 +457,11 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+    # ChronoMoE: Advance step at end of iteration (validates this step's events, prepares next)
+    if MANAGER.is_telemetry_enabled():
+        MANAGER.set_step(iter_num + 1)
+
     iter_num += 1
     local_iter_num += 1
 

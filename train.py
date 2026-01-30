@@ -247,7 +247,8 @@ if use_chrono_controller and n_exp > 1 and n_moe_layers > 0:
     # This must happen before DDP wrapping and on all ranks for gradient sync
     moe_layer_ids = []
     for i, block in enumerate(model.transformer.h):
-        if hasattr(block, 'router'):  # This block has MoE
+        # Router is inside block.mlp for MOELayer blocks
+        if hasattr(block.mlp, 'router'):  # This block has MoE
             moe_layer_ids.append(i)
             lens = ChronoLens(
                 d_model=n_embd,
@@ -255,8 +256,7 @@ if use_chrono_controller and n_exp > 1 and n_moe_layers > 0:
                 layer_id=i,
             ).to(device)
             MANAGER.register_lens(i, lens)
-            # Also attach lens to block for reference
-            block.chrono_lens = lens
+            # Note: Don't attach to block - would cause duplicate optimizer params
 
     if master_process:
         print(f"ChronoMoE Phase 2: {len(moe_layer_ids)} lenses created (rank={chrono_lens_rank})")

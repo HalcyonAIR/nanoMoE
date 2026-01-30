@@ -79,6 +79,10 @@ use_switch_tfm_init = False
 switch_tfm_init_scale = 1.0  # recommended 0.1 for stability (pg.10, https://arxiv.org/abs/2101.03961)
 router_use_full_prec = False
 
+# chronomoe Phase 2 controller
+use_chrono_controller = True  # Enable Phase 2 pressure controller and lens warping
+chrono_lens_rank = 8          # Rank of low-rank lens warp
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -236,8 +240,8 @@ model.to(device)
 # -----------------------------------------------------------------------------
 if master_process and n_exp > 1:
     import uuid
-    from chrono.io import create_run_manifest
-    from chrono.snapshots import SystemSnapshot
+    from chronomoe.io import create_run_manifest
+    from chronomoe.snapshots import SystemSnapshot
 
     # Generate unique run_id
     run_id = f"run_{uuid.uuid4().hex[:8]}"
@@ -280,6 +284,37 @@ if master_process and n_exp > 1:
     print(f"ChronoMoE telemetry initialized: {run_id}")
     print(f"  Output: {MANAGER.telemetry_writer.run_dir}")
 
+    # Phase 2: Initialize controller and lenses
+    if use_chrono_controller:
+        from chronomoe import ChronoLens
+        from chronomoe.controller import ControlConfig
+
+        # Initialize controller
+        n_experts_list = [n_exp] * n_moe_layers
+        MANAGER.initialize_controller(
+            n_layers=n_moe_layers,
+            n_experts_per_layer=n_experts_list,
+            config=ControlConfig(),  # Use defaults (frozen for experiments)
+            output_dir=os.path.join(out_dir, 'telemetry'),
+        )
+
+        # Create and register lenses for each MoE layer
+        # Note: at this point, model hasn't been DDP-wrapped yet, so we can access directly
+        moe_layer_ids = []
+        for i, block in enumerate(model.transformer.h):
+            if hasattr(block, 'router'):  # This block has MoE
+                moe_layer_ids.append(i)
+                lens = ChronoLens(
+                    d_model=n_embd,
+                    rank=chrono_lens_rank,
+                    layer_id=i,
+                ).to(device)
+                MANAGER.register_lens(i, lens)
+                # Also attach lens to block for reference
+                block.chrono_lens = lens
+
+        print(f"ChronoMoE Phase 2: {len(moe_layer_ids)} lenses created (rank={chrono_lens_rank})")
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
@@ -288,6 +323,18 @@ optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
+
+# Add lens parameters to optimizer (Phase 2)
+# Note: lenses only exist when n_exp > 1, but we gate on controller being enabled
+if MANAGER.is_controller_enabled():
+    lens_params = MANAGER.get_lens_parameters()
+    if lens_params:
+        # Add lens params as a new group with same LR
+        optimizer.add_param_group({
+            'params': lens_params,
+            'weight_decay': 0.0,  # No weight decay for lens params
+        })
+        print(f"Added {len(lens_params)} lens parameters to optimizer")
 
 # compile the model
 if compile:
@@ -398,6 +445,10 @@ while True:
             for layer in snapshot.layers:
                 print(f"  Layer {layer.layer_id}: Neff={layer.n_effective:.2f}, "
                       f"Top2={layer.top2_share:.2f}, dead={layer.dead_expert_count}")
+
+            # Phase 2: Update controller (sets lens scales based on pressure)
+            if MANAGER.is_controller_enabled():
+                decisions = MANAGER.update_controller(snapshot)
 
             # Flush routing events after snapshot
             flushed = MANAGER.flush_routing_events()

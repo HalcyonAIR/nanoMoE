@@ -1,20 +1,19 @@
 """
-MOEManager: Global singleton for MoE loss aggregation and telemetry.
+MOEManager: Global singleton for MoE loss aggregation, telemetry, and control.
 
-Phase 1 additions:
-- Routing event collection and flushing
-- Lens interface (identity by default)
-- Step/mode tracking for telemetry
+Phase 1: Routing event collection, snapshots, alerts
+Phase 2: Pressure controller, lens warping, decision logging
 """
 
 from typing import List, Optional, Set, Dict, TYPE_CHECKING
 import torch
 
-# Type hints for chrono types (avoid circular imports at runtime)
+# Type hints for chronomoe types (avoid circular imports at runtime)
 if TYPE_CHECKING:
-    from chrono.events import RoutingEvent
-    from chrono.io import TelemetryWriter
-    from chrono.lens import ChronoLens, LensState
+    from chronomoe.events import RoutingEvent
+    from chronomoe.io import TelemetryWriter
+    from chronomoe.lens import ChronoLens
+    from chronomoe.controller import Controller, ControlConfig
 
 
 class MOEManager:
@@ -22,10 +21,8 @@ class MOEManager:
     Wrapper class for tracking, storing, and aggregating auxiliary
     losses across multiple MoE layers in the model.
 
-    Phase 1 telemetry additions:
-    - Routing events collected per (step, layer)
-    - Lens interface for future geometry warping
-    - Step and mode tracking
+    Phase 1: Telemetry - routing events, snapshots, alerts
+    Phase 2: Governance - controller, lenses, decisions
     """
 
     def __init__(self):
@@ -33,23 +30,24 @@ class MOEManager:
         self.aux_loss: List[torch.Tensor] = []
         self.router_z_loss: List[torch.Tensor] = []
 
-        # NEW: Phase 1 telemetry (tightened type hints)
+        # Phase 1: Telemetry
         self.routing_events: List['RoutingEvent'] = []
         self.telemetry_writer: Optional['TelemetryWriter'] = None
         self.current_step: int = 0
         self.run_id: str = ""
         self.mode: str = "TRAIN"  # "TRAIN" or "INFER"
 
-        # NEW: Lens interface (Phase 1: identity)
-        self._lens: Optional['ChronoLens'] = None
-        self._lens_state: Optional['LensState'] = None
-
-        # NEW: Alert history for persistent alert tracking
+        # Phase 1: Alert history for persistent alert tracking
         self.alert_history: Dict[int, Dict[str, int]] = {}
 
         # Track number of MoE layers for validation
         self._expected_moe_layers: Optional[int] = None
         self._seen_layer_ids: Set[int] = set()
+
+        # Phase 2: Controller and lenses
+        self.controller: Optional['Controller'] = None
+        self.lenses: Dict[int, 'ChronoLens'] = {}
+        self._controller_enabled: bool = False
 
     # -------------------------------------------------------------------------
     # Existing methods: auxiliary loss tracking
@@ -74,7 +72,7 @@ class MOEManager:
         return sum(self.router_z_loss)
 
     # -------------------------------------------------------------------------
-    # NEW: Phase 1 telemetry methods
+    # Phase 1: Telemetry methods
     # -------------------------------------------------------------------------
 
     def initialize_telemetry(
@@ -91,7 +89,7 @@ class MOEManager:
             output_dir: Base directory for outputs
             n_moe_layers: Expected number of MoE layers (for validation)
         """
-        from chrono.io import TelemetryWriter
+        from chronomoe.io import TelemetryWriter
 
         self.run_id = run_id
         self.telemetry_writer = TelemetryWriter(run_id, output_dir)
@@ -126,7 +124,7 @@ class MOEManager:
         if not self.is_telemetry_enabled():
             return  # Telemetry not enabled, skip silently
 
-        from chrono.events import RoutingEvent
+        from chronomoe.events import RoutingEvent
 
         # Track seen layer_ids for validation (reset happens in set_step)
         self._seen_layer_ids.add(layer_id)
@@ -190,29 +188,57 @@ class MOEManager:
         return self.routing_events
 
     # -------------------------------------------------------------------------
-    # NEW: Lens interface (Phase 1: identity by default)
+    # Phase 2: Controller and lens methods
     # -------------------------------------------------------------------------
 
-    def attach_lens(self, lens: Optional['ChronoLens']) -> None:
+    def initialize_controller(
+        self,
+        n_layers: int,
+        n_experts_per_layer: List[int],
+        config: Optional['ControlConfig'] = None,
+        output_dir: str = "outputs",
+    ) -> None:
         """
-        Attach a lens module.
+        Initialize Phase 2 controller.
 
         Args:
-            lens: ChronoLens instance or None (reverts to IdentityLens)
+            n_layers: Number of MoE layers
+            n_experts_per_layer: List of expert counts per layer
+            config: Controller hyperparameters (uses defaults if None)
+            output_dir: Base directory for outputs
         """
-        from chrono.lens import IdentityLens
+        from chronomoe.controller import Controller, ControlConfig
 
-        if lens is None:
-            self._lens = IdentityLens()
-        else:
-            self._lens = lens
+        self.controller = Controller(
+            n_layers=n_layers,
+            n_experts_per_layer=n_experts_per_layer,
+            config=config or ControlConfig(),
+            output_dir=output_dir,
+        )
+        self.controller.initialize(self.run_id)
+        self._controller_enabled = True
+        print(f"ChronoMoE Phase 2 controller initialized")
+
+    def is_controller_enabled(self) -> bool:
+        """Check if Phase 2 controller is active."""
+        return self._controller_enabled and self.controller is not None
+
+    def register_lens(self, layer_id: int, lens: 'ChronoLens') -> None:
+        """
+        Register a lens for a layer.
+
+        Args:
+            layer_id: MoE layer index
+            lens: ChronoLens instance
+        """
+        self.lenses[layer_id] = lens
 
     def apply_lens(self, x: torch.Tensor, layer_id: int) -> torch.Tensor:
         """
         Apply the lens to router input x.
 
-        Phase 1 default is identity, so this call is safe to insert
-        without changing behavior.
+        Phase 1: Identity (no warp)
+        Phase 2: Low-rank warp gated by controller pressure
 
         Args:
             x: Router input tensor (e.g., [B, T, D])
@@ -221,25 +247,53 @@ class MOEManager:
         Returns:
             Transformed tensor with same shape as x
         """
-        # Lazy initialization of lens
-        if self._lens is None:
-            from chrono.lens import IdentityLens
-            self._lens = IdentityLens()
+        if layer_id in self.lenses:
+            return self.lenses[layer_id](x)
+        return x  # No lens registered, return unchanged
 
-        # Build/update lens state
-        from chrono.lens import LensState
+    def update_controller(self, snapshot: 'SystemSnapshot') -> Optional[List]:
+        """
+        Update controller from snapshot and set lens scales.
 
-        self._lens_state = LensState(
-            step=self.current_step,
-            mode=self.mode,
-            pressure=0.0,  # Phase 1: placeholder
-            heat=0.0,      # Phase 1: placeholder
-            forgetting=0.0,  # Phase 1: placeholder
-            layer_metrics=None,  # Phase 1: placeholder
-            meta=None,
-        )
+        Call this at each eval checkpoint after creating the snapshot.
 
-        return self._lens(x, self._lens_state, layer_id)
+        Args:
+            snapshot: SystemSnapshot with layer metrics
+
+        Returns:
+            List of ControlDecision logs, or None if controller not enabled
+        """
+        if not self.is_controller_enabled():
+            return None
+
+        decisions = self.controller.update(snapshot, self.lenses)
+
+        # Log pressure/scale for each layer
+        for decision in decisions:
+            pressure = decision.computed['pressure']
+            scale = decision.actuator['lens_scale']
+            if pressure > 0.01:  # Only log if there's meaningful pressure
+                print(f"  Layer {decision.layer_id}: pressure={pressure:.3f}, lens_scale={scale:.4f}")
+
+        return decisions
+
+    def get_lens_parameters(self) -> List[torch.nn.Parameter]:
+        """
+        Get all lens parameters for optimizer.
+
+        Returns:
+            List of lens parameters
+        """
+        params = []
+        for lens in self.lenses.values():
+            params.extend(lens.parameters())
+        return params
+
+    def get_controller_state(self, layer_id: int):
+        """Get current control state for a layer."""
+        if self.controller:
+            return self.controller.get_state(layer_id)
+        return None
 
 
 # Global singleton instance

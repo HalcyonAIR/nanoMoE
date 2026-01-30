@@ -236,18 +236,42 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # -----------------------------------------------------------------------------
-# ChronoMoE Phase 1: Initialize telemetry
+# ChronoMoE Phase 2: Create lenses (ALL RANKS - required for DDP)
+# -----------------------------------------------------------------------------
+n_moe_layers = getattr(model, '_n_moe_layers', None) or 0
+
+if use_chrono_controller and n_exp > 1 and n_moe_layers > 0:
+    from chronomoe import ChronoLens
+
+    # Create and register lenses for each MoE layer on ALL ranks
+    # This must happen before DDP wrapping and on all ranks for gradient sync
+    moe_layer_ids = []
+    for i, block in enumerate(model.transformer.h):
+        if hasattr(block, 'router'):  # This block has MoE
+            moe_layer_ids.append(i)
+            lens = ChronoLens(
+                d_model=n_embd,
+                rank=chrono_lens_rank,
+                layer_id=i,
+            ).to(device)
+            MANAGER.register_lens(i, lens)
+            # Also attach lens to block for reference
+            block.chrono_lens = lens
+
+    if master_process:
+        print(f"ChronoMoE Phase 2: {len(moe_layer_ids)} lenses created (rank={chrono_lens_rank})")
+
+# -----------------------------------------------------------------------------
+# ChronoMoE Phase 1: Initialize telemetry (MASTER ONLY)
 # -----------------------------------------------------------------------------
 if master_process and n_exp > 1:
     import uuid
     from chronomoe.io import create_run_manifest
     from chronomoe.snapshots import SystemSnapshot
+    from chronomoe.controller import ControlConfig
 
     # Generate unique run_id
     run_id = f"run_{uuid.uuid4().hex[:8]}"
-
-    # Get number of MoE layers from model
-    n_moe_layers = getattr(model, '_n_moe_layers', None)
 
     # Initialize telemetry
     MANAGER.initialize_telemetry(
@@ -261,7 +285,7 @@ if master_process and n_exp > 1:
         'dataset': dataset,
         'seed': 1337 + seed_offset,
         'n_layer': n_layer,
-        'n_experts_per_layer': [n_exp] * (n_moe_layers or 0),
+        'n_experts_per_layer': [n_exp] * n_moe_layers,
         'top_k': top_k,
         'capacity_factor': train_capacity,
         'aux_loss_weight': aux_loss_weight,
@@ -284,12 +308,8 @@ if master_process and n_exp > 1:
     print(f"ChronoMoE telemetry initialized: {run_id}")
     print(f"  Output: {MANAGER.telemetry_writer.run_dir}")
 
-    # Phase 2: Initialize controller and lenses
-    if use_chrono_controller:
-        from chronomoe import ChronoLens
-        from chronomoe.controller import ControlConfig
-
-        # Initialize controller
+    # Initialize controller (master only - it just logs decisions)
+    if use_chrono_controller and n_moe_layers > 0:
         n_experts_list = [n_exp] * n_moe_layers
         MANAGER.initialize_controller(
             n_layers=n_moe_layers,
@@ -297,23 +317,6 @@ if master_process and n_exp > 1:
             config=ControlConfig(),  # Use defaults (frozen for experiments)
             output_dir=os.path.join(out_dir, 'telemetry'),
         )
-
-        # Create and register lenses for each MoE layer
-        # Note: at this point, model hasn't been DDP-wrapped yet, so we can access directly
-        moe_layer_ids = []
-        for i, block in enumerate(model.transformer.h):
-            if hasattr(block, 'router'):  # This block has MoE
-                moe_layer_ids.append(i)
-                lens = ChronoLens(
-                    d_model=n_embd,
-                    rank=chrono_lens_rank,
-                    layer_id=i,
-                ).to(device)
-                MANAGER.register_lens(i, lens)
-                # Also attach lens to block for reference
-                block.chrono_lens = lens
-
-        print(f"ChronoMoE Phase 2: {len(moe_layer_ids)} lenses created (rank={chrono_lens_rank})")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -325,8 +328,8 @@ if init_from == 'resume':
 checkpoint = None # free up memory
 
 # Add lens parameters to optimizer (Phase 2)
-# Note: lenses only exist when n_exp > 1, but we gate on controller being enabled
-if MANAGER.is_controller_enabled():
+# Gate on config and lens existence, not controller state (DDP-safe)
+if use_chrono_controller and n_exp > 1:
     lens_params = MANAGER.get_lens_parameters()
     if lens_params:
         # Add lens params as a new group with same LR
@@ -334,7 +337,8 @@ if MANAGER.is_controller_enabled():
             'params': lens_params,
             'weight_decay': 0.0,  # No weight decay for lens params
         })
-        print(f"Added {len(lens_params)} lens parameters to optimizer")
+        if master_process:
+            print(f"Added {len(lens_params)} lens parameters to optimizer")
 
 # compile the model
 if compile:

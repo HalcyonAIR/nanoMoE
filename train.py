@@ -84,6 +84,8 @@ router_use_full_prec = False
 use_chrono_controller = True  # Enable Phase 2 pressure controller and lens warping
 chrono_lens_rank = 8          # Rank of low-rank lens warp
 chrono_prior_state_path = ''  # Clock 3: path to persisted prior state (empty = fresh)
+chrono_constitutional_scale_mult = 1.0  # Clock 3: constitutional scale multiplier (1.0 = neutral)
+chrono_constitutional_abstain_mult = 1.0  # Clock 3: constitutional abstain threshold multiplier
 # Controller thresholds (can override defaults for testing)
 chrono_neff_threshold_ratio = 0.6   # Neff < ratio*n triggers debt
 chrono_top2_warning = 0.75          # Top2 > this triggers debt
@@ -383,10 +385,21 @@ if master_process and n_exp > 1:
     if use_chrono_controller and n_moe_layers > 0:
         n_experts_list = [n_exp] * n_moe_layers
         # Allow config overrides for testing (frozen for production experiments)
+        # Clock 3: Apply constitutional priors
+        adjusted_scale_max = 0.5 * chrono_constitutional_scale_mult
+        adjusted_warmup_scale = 0.02 * chrono_constitutional_scale_mult
+        adjusted_abstain_threshold = 0.15 * chrono_constitutional_abstain_mult
         ctrl_config = ControlConfig(
             neff_threshold_ratio=chrono_neff_threshold_ratio,
             top2_warning=chrono_top2_warning,
+            lens_scale_max=adjusted_scale_max,
+            lens_warmup_scale=adjusted_warmup_scale,
+            abstain_backoff_threshold=adjusted_abstain_threshold,
         )
+        if chrono_constitutional_scale_mult != 1.0 or chrono_constitutional_abstain_mult != 1.0:
+            print(f"Clock 3: Constitutional priors - "
+                  f"abstain_threshold={adjusted_abstain_threshold:.3f}, "
+                  f"warmup_scale={adjusted_warmup_scale:.4f}")
         MANAGER.initialize_controller(
             n_layers=n_moe_layers,
             n_experts_per_layer=n_experts_list,

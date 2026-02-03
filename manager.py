@@ -29,6 +29,7 @@ class MOEManager:
         # Existing: auxiliary loss tracking
         self.aux_loss: List[torch.Tensor] = []
         self.router_z_loss: List[torch.Tensor] = []
+        self.lens_aux_loss: List[torch.Tensor] = []  # Phase 2: lens training signal
 
         # Phase 1: Telemetry
         self.routing_events: List['RoutingEvent'] = []
@@ -59,17 +60,28 @@ class MOEManager:
     def reset_router_z_loss(self) -> None:
         self.router_z_loss = []
 
+    def reset_lens_aux_loss(self) -> None:
+        self.lens_aux_loss = []
+
     def add_aux_loss(self, loss: torch.Tensor) -> None:
         self.aux_loss.append(loss)
 
     def add_router_z_loss(self, loss: torch.Tensor) -> None:
         self.router_z_loss.append(loss)
 
+    def add_lens_aux_loss(self, loss: torch.Tensor) -> None:
+        self.lens_aux_loss.append(loss)
+
     def aggregate_aux_loss(self) -> torch.Tensor:
         return sum(self.aux_loss)
 
     def aggregate_router_z_loss(self) -> torch.Tensor:
         return sum(self.router_z_loss)
+
+    def aggregate_lens_aux_loss(self) -> torch.Tensor:
+        if not self.lens_aux_loss:
+            return torch.tensor(0.0)
+        return sum(self.lens_aux_loss)
 
     # -------------------------------------------------------------------------
     # Phase 1: Telemetry methods

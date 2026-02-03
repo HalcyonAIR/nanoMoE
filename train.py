@@ -82,6 +82,21 @@ router_use_full_prec = False
 # chronomoe Phase 2 controller
 use_chrono_controller = True  # Enable Phase 2 pressure controller and lens warping
 chrono_lens_rank = 8          # Rank of low-rank lens warp
+# Controller thresholds (can override defaults for testing)
+chrono_neff_threshold_ratio = 0.6   # Neff < ratio*n triggers debt
+chrono_top2_warning = 0.75          # Top2 > this triggers debt
+
+# Forced pathology (for controller testing)
+collapse_bias_expert_id = -1   # -1 = disabled, 0..n_exp-1 = target expert
+collapse_bias_strength = 5.0   # Additive logit bias
+collapse_bias_start_step = 100 # Step to start bias
+collapse_bias_end_step = 200   # Step to end bias
+
+# Knowledge Distillation (for distillation experiments)
+use_kd_loss = False            # Enable KD loss from teacher
+kd_teacher_path = ''           # Path to teacher checkpoint
+kd_temperature = 2.0           # Temperature for soft targets
+kd_alpha = 0.5                 # Weight: alpha*KD + (1-alpha)*CE
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -185,7 +200,11 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   router_z_loss_weight=router_z_loss_weight, train_capacity=train_capacity,
                   eval_capacity=eval_capacity, min_capacity=min_capacity, stride=stride,
                   use_switch_tfm_init=use_switch_tfm_init, switch_tfm_init_scale=switch_tfm_init_scale,
-                  router_use_full_prec=router_use_full_prec) # start with model_args from command line
+                  router_use_full_prec=router_use_full_prec,
+                  collapse_bias_expert_id=collapse_bias_expert_id,
+                  collapse_bias_strength=collapse_bias_strength,
+                  collapse_bias_start_step=collapse_bias_start_step,
+                  collapse_bias_end_step=collapse_bias_end_step) # start with model_args from command line
 print('\n\n')
 print(model_args)
 print('\n\n')
@@ -236,6 +255,28 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # -----------------------------------------------------------------------------
+# Knowledge Distillation: Load teacher model if enabled
+# -----------------------------------------------------------------------------
+teacher_model = None
+if use_kd_loss and kd_teacher_path:
+    print(f"Loading teacher model from {kd_teacher_path}")
+    teacher_ckpt = torch.load(kd_teacher_path, map_location=device)
+    teacher_conf = GPTConfig(**teacher_ckpt['model_args'])
+    teacher_model = GPT(teacher_conf)
+    teacher_state_dict = teacher_ckpt['model']
+    # Fix unwanted prefix if present
+    unwanted_prefix = '_orig_mod.'
+    for k, v in list(teacher_state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            teacher_state_dict[k[len(unwanted_prefix):]] = teacher_state_dict.pop(k)
+    teacher_model.load_state_dict(teacher_state_dict)
+    teacher_model.to(device)
+    teacher_model.eval()  # Teacher is always in eval mode
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+    print(f"Teacher loaded successfully (KD temp={kd_temperature}, alpha={kd_alpha})")
+
+# -----------------------------------------------------------------------------
 # ChronoMoE Phase 2: Create lenses (ALL RANKS - required for DDP)
 # -----------------------------------------------------------------------------
 n_moe_layers = getattr(model, '_n_moe_layers', None) or 0
@@ -255,11 +296,16 @@ if use_chrono_controller and n_exp > 1 and n_moe_layers > 0:
                 rank=chrono_lens_rank,
                 layer_id=i,
             ).to(device)
+            # Set router weights for anti-dominance steering (Phase 2)
+            router = block.mlp.router
+            lens.set_router_weights(router.w_g.weight)
             MANAGER.register_lens(i, lens)
             # Note: Don't attach to block - would cause duplicate optimizer params
 
-    if master_process:
-        print(f"ChronoMoE Phase 2: {len(moe_layer_ids)} lenses created (rank={chrono_lens_rank})")
+    # Log lens creation on ALL ranks for DDP verification
+    # (In DDP, all ranks must create identical lenses for gradient sync)
+    ddp_rank_info = f" [DDP rank {ddp_local_rank}]" if ddp else ""
+    print(f"ChronoMoE Phase 2: {len(moe_layer_ids)} lenses created (low_rank={chrono_lens_rank}){ddp_rank_info}")
 
 # -----------------------------------------------------------------------------
 # ChronoMoE Phase 1: Initialize telemetry (MASTER ONLY)
@@ -311,10 +357,15 @@ if master_process and n_exp > 1:
     # Initialize controller (master only - it just logs decisions)
     if use_chrono_controller and n_moe_layers > 0:
         n_experts_list = [n_exp] * n_moe_layers
+        # Allow config overrides for testing (frozen for production experiments)
+        ctrl_config = ControlConfig(
+            neff_threshold_ratio=chrono_neff_threshold_ratio,
+            top2_warning=chrono_top2_warning,
+        )
         MANAGER.initialize_controller(
             n_layers=n_moe_layers,
             n_experts_per_layer=n_experts_list,
-            config=ControlConfig(),  # Use defaults (frozen for experiments)
+            config=ctrl_config,
             output_dir=os.path.join(out_dir, 'telemetry'),
         )
 
@@ -485,6 +536,21 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
+
+            # Knowledge Distillation loss
+            if teacher_model is not None:
+                with torch.no_grad():
+                    teacher_logits, _ = teacher_model(X)
+
+                # KD loss: KL divergence between soft targets
+                # L_KD = T^2 * KL(softmax(teacher/T) || softmax(student/T))
+                soft_teacher = torch.nn.functional.softmax(teacher_logits / kd_temperature, dim=-1)
+                soft_student = torch.nn.functional.log_softmax(logits / kd_temperature, dim=-1)
+                kd_loss = torch.nn.functional.kl_div(soft_student, soft_teacher, reduction='batchmean') * (kd_temperature ** 2)
+
+                # Combined loss: alpha * KD + (1 - alpha) * CE
+                loss = kd_alpha * kd_loss + (1 - kd_alpha) * loss
+
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')

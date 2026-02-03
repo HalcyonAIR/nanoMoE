@@ -99,6 +99,12 @@ class Router(nn.Module):
         self.use_aux_loss = config.use_aux_loss
         self.use_router_z_loss = config.use_router_z_loss
 
+        # Forced pathology settings (for controller testing)
+        self.collapse_bias_expert_id = config.collapse_bias_expert_id
+        self.collapse_bias_strength = config.collapse_bias_strength
+        self.collapse_bias_start_step = config.collapse_bias_start_step
+        self.collapse_bias_end_step = config.collapse_bias_end_step
+
         # linear projection for (noisy) softmax gating
         # no bias is used, see page 4 eq (4) in (https://arxiv.org/abs/1701.06538)
         self.w_g = nn.Linear(config.n_embd, config.n_exp, bias=False)
@@ -126,11 +132,24 @@ class Router(nn.Module):
                 noise *= torch.randn_like(noise)
                 logits += noise
 
+            # Forced pathology: bias logits toward one expert during specified window
+            # This is used to test controller recovery under induced collapse
+            if self.collapse_bias_expert_id >= 0:
+                current_step = MANAGER.current_step
+                if self.collapse_bias_start_step <= current_step < self.collapse_bias_end_step:
+                    logits[:, :, self.collapse_bias_expert_id] += self.collapse_bias_strength
+
             # router z loss, computed on logits (before softmax)
             # this loss prevents router logits from becoming too large
             if self.use_router_z_loss:
                 z_loss = self.compute_router_z_loss(logits)
                 MANAGER.add_router_z_loss(z_loss)
+
+            # Phase 2: Lens auxiliary loss - direct training signal for lens
+            # Penalizes concentration to teach lens anti-collapse directions
+            if MANAGER.is_controller_enabled() and self.training:
+                lens_aux = self.compute_lens_aux_loss(logits)
+                MANAGER.add_lens_aux_loss(lens_aux)
 
             # find top k experts for each token
             top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1) # [B, T, k]
@@ -234,7 +253,7 @@ class Router(nn.Module):
         Computes ST-MoE router z loss (https://arxiv.org/abs/2202.08906)
         See equation (5) on page 7
         """
-    
+
         # exponentiate logits, sum logits of each expert, take log, and square
         # code below is the same as:
         # > z_loss = torch.exp(logits)
@@ -244,6 +263,41 @@ class Router(nn.Module):
 
         # sum over all tokens and divide by total number of tokens
         return torch.mean(z_loss)
+
+    def compute_lens_aux_loss(self, logits: torch.Tensor):
+        """
+        Phase 2: Auxiliary loss to train lens toward anti-collapse directions.
+
+        Penalizes:
+        1. Low entropy (concentration toward few experts)
+        2. High top2 share (dominant experts)
+
+        This gives the lens a direct training signal to push routing
+        away from collapse, rather than relying on indirect task loss.
+        """
+        # Compute softmax probabilities
+        probs = F.softmax(logits, dim=-1)  # [B, T, n_exp]
+
+        # Mean probabilities across batch and sequence
+        mean_probs = probs.mean(dim=(0, 1))  # [n_exp]
+
+        # Target entropy for uniform distribution: log(n_exp)
+        target_entropy = math.log(self.n_exp)
+
+        # Entropy loss: penalize low entropy
+        eps = 1e-8
+        entropy = -torch.sum(mean_probs * torch.log(mean_probs + eps))
+        entropy_loss = F.relu(target_entropy - entropy)
+
+        # Target top2 share: with top_k=2 and n_exp=4, ideal is 0.5
+        target_top2 = self.top_k / self.n_exp
+
+        # Top2 loss: penalize high concentration
+        sorted_probs, _ = torch.sort(mean_probs, descending=True)
+        top2_share = sorted_probs[:2].sum()
+        top2_loss = F.relu(top2_share - target_top2)
+
+        return entropy_loss + top2_loss
 
     def get_capacity(self, tokens_per_batch):
         # expert capacity is given by (tokens_per_batch / num_experts) * capacity_factor
@@ -364,7 +418,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
-    # MoE-related configs 
+    # MoE-related configs
     n_exp: int = 1 # if n_exp = 1 we just use regular MLP layers
     top_k: int = 2
     use_aux_loss: bool = False # apply auxiliary loss (from Switch Transformer) in router
@@ -379,6 +433,13 @@ class GPTConfig:
     use_switch_tfm_init: bool = False  # use weight init scheme from Switch Transformer
     switch_tfm_init_scale: float = 1.0
     router_use_full_prec: bool = False  # use float32 precision in the router
+
+    # Forced pathology: bias router logits toward one expert for a fixed window
+    # Used to test controller recovery under induced collapse
+    collapse_bias_expert_id: int = -1  # -1 = disabled, 0..n_exp-1 = target expert
+    collapse_bias_strength: float = 5.0  # additive logit bias
+    collapse_bias_start_step: int = 100  # step to start bias
+    collapse_bias_end_step: int = 200  # step to end bias
 
 
 class GPT(nn.Module):
@@ -536,6 +597,12 @@ class GPT(nn.Module):
             if self.config.n_exp > 1 and self.config.use_router_z_loss:
                 loss += self.config.router_z_loss_weight * MANAGER.aggregate_router_z_loss()
                 MANAGER.reset_router_z_loss()
+            # Phase 2: Lens auxiliary loss (trains lens toward anti-collapse directions)
+            if self.config.n_exp > 1 and MANAGER.is_controller_enabled():
+                lens_aux = MANAGER.aggregate_lens_aux_loss()
+                if lens_aux.requires_grad:  # Only add if there's something to backprop
+                    loss += 0.01 * lens_aux  # Small weight - lens learns slowly
+                MANAGER.reset_lens_aux_loss()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim

@@ -83,6 +83,7 @@ router_use_full_prec = False
 # chronomoe Phase 2 controller
 use_chrono_controller = True  # Enable Phase 2 pressure controller and lens warping
 chrono_lens_rank = 8          # Rank of low-rank lens warp
+chrono_prior_state_path = ''  # Clock 3: path to persisted prior state (empty = fresh)
 # Controller thresholds (can override defaults for testing)
 chrono_neff_threshold_ratio = 0.6   # Neff < ratio*n triggers debt
 chrono_top2_warning = 0.75          # Top2 > this triggers debt
@@ -392,6 +393,10 @@ if master_process and n_exp > 1:
             config=ctrl_config,
             output_dir=os.path.join(out_dir, 'telemetry'),
         )
+
+        # Clock 3: Load prior state if provided
+        if chrono_prior_state_path:
+            MANAGER.load_prior_state(chrono_prior_state_path)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))

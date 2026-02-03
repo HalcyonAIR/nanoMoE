@@ -307,6 +307,62 @@ class MOEManager:
             return self.controller.get_state(layer_id)
         return None
 
+    def load_prior_state(self, prior_path: str) -> bool:
+        """
+        Load persisted control state as prior for Clock 3 persistence.
+
+        This injects learned state (harm_backoff, mode_scores, pressure)
+        into the controller, allowing it to start with "memory" of
+        what worked in a previous run.
+
+        Args:
+            prior_path: Path to pickled prior state file
+
+        Returns:
+            True if prior was loaded successfully
+        """
+        import pickle
+        from pathlib import Path
+
+        if not self.is_controller_enabled():
+            print("WARNING: Cannot load prior state - controller not enabled")
+            return False
+
+        path = Path(prior_path)
+        if not path.exists():
+            print(f"WARNING: Prior state file not found: {prior_path}")
+            return False
+
+        try:
+            with open(path, 'rb') as f:
+                layer_states = pickle.load(f)
+
+            # Inject into controller states
+            for layer_id, prior in layer_states.items():
+                if layer_id in self.controller.states:
+                    state = self.controller.states[layer_id]
+                    # Load persisted values
+                    if 'harm_backoff' in prior:
+                        state.harm_backoff = prior['harm_backoff']
+                    if 'mode_scores' in prior:
+                        state.mode_scores = prior['mode_scores']
+                    if 'pressure' in prior:
+                        state.pressure = prior['pressure']
+                    if 'active_mode' in prior:
+                        state.active_mode = prior['active_mode']
+                    # Critical for harm detection continuity
+                    if 'prev_top2' in prior:
+                        state.prev_top2 = prior['prev_top2']
+                    if 'prev_scale' in prior:
+                        state.prev_scale = prior['prev_scale']
+
+            print(f"Clock 3: Loaded prior state for {len(layer_states)} layers from {prior_path}")
+            return True
+
+        except Exception as e:
+            print(f"WARNING: Failed to load prior state: {e}")
+            return False
+
 
 # Global singleton instance
 MANAGER = MOEManager()

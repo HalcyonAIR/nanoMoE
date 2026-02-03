@@ -43,7 +43,8 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'scratch' # 'scratch' or 'resume' or 'finetune' or 'gpt2*'
+ckpt_path = '' # custom checkpoint path (for resume/finetune from different dir)
 
 # wandb logging
 wandb_log = True # False # disabled by default
@@ -218,9 +219,11 @@ if init_from == 'scratch':
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    # Use custom ckpt_path if provided, otherwise use out_dir/ckpt.pt
+    if not ckpt_path:
+        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    print(f"Resuming training from {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -240,6 +243,27 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+elif init_from == 'finetune':
+    # fine-tune from a checkpoint: load weights but reset training state
+    if not ckpt_path:
+        raise ValueError("ckpt_path must be provided for init_from='finetune'")
+    print(f"Fine-tuning from {ckpt_path} (resetting training state)")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+    # force these config attributes to be equal
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
+    # create the model
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    state_dict = checkpoint['model']
+    # fix the keys of the state dictionary
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    # NOTE: iter_num and best_val_loss stay at 0 / inf for fine-tuning
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
